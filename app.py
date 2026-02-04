@@ -17,13 +17,13 @@ except:
     st.stop()
 
 # ==========================================
-# 2. 解析を行う関数（PDF対応版）
+# 2. 解析を行う関数
 # ==========================================
 def analyze_document(input_data, mime_type):
     genai.configure(api_key=GOOGLE_API_KEY)
     
-    # PDFも扱えるモデルを使用
-    model_name = "gemini-1.5-flash" 
+    # 【修正箇所】あなたの環境で確実に動くモデル名にしました
+    model_name = "gemini-flash-latest" 
 
     prompt = """
     以下のレシート・納品書・請求書（画像またはPDF）を読み取り、純粋なJSON形式のみを出力してください。
@@ -52,16 +52,14 @@ def analyze_document(input_data, mime_type):
         model = genai.GenerativeModel(model_name)
         
         with st.spinner(f"AIが書類を解析中... ({mime_type})"):
-            # 画像とPDFでデータの渡し方が少し異なります
+            # PDFと画像で処理を分ける
             if mime_type == "application/pdf":
-                # PDFの場合は辞書形式で渡す
                 content_part = {
                     "mime_type": "application/pdf",
                     "data": input_data
                 }
                 response = model.generate_content([prompt, content_part], request_options={"timeout": 600})
             else:
-                # 画像の場合は今まで通り
                 response = model.generate_content([prompt, input_data], request_options={"timeout": 600})
 
             text = response.text
@@ -72,6 +70,8 @@ def analyze_document(input_data, mime_type):
         error_msg = str(e)
         if "429" in error_msg:
             st.error("⚠️ 混雑のためエラーになりました。少し時間をおいて再試行してください。")
+        elif "404" in error_msg:
+            st.error("⚠️ モデルが見つかりません。コード内の model_name を確認してください。")
         else:
             st.error(f"エラーが発生しました: {e}")
         return None
@@ -85,21 +85,17 @@ st.markdown("レシート(画像)や請求書(PDF)から **JAN・上代・掛け
 col1, col2 = st.columns(2)
 
 with col1:
-    # PDFも許可するように設定を変更
     uploaded_file = st.file_uploader("書類をアップロード", type=["jpg", "png", "jpeg", "webp", "pdf"])
     
     target_data = None
     file_type = ""
 
     if uploaded_file:
-        # ファイルの種類を判定
         if uploaded_file.type == "application/pdf":
             st.info("📄 PDFファイルが選択されました")
-            # PDFの場合はバイトデータとして読み込む
             target_data = uploaded_file.getvalue()
             file_type = "application/pdf"
         else:
-            # 画像の場合
             image = Image.open(uploaded_file)
             st.image(image, caption="アップロード画像", use_container_width=True)
             target_data = image
