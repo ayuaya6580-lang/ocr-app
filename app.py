@@ -8,7 +8,7 @@ import time
 # ==========================================
 # 1. アプリの設定
 # ==========================================
-st.set_page_config(page_title="AI仕入れ・経費読み取り", layout="wide")
+st.set_page_config(page_title="AI一括伝票読み取り", layout="wide")
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -21,105 +21,96 @@ except:
 # ==========================================
 def analyze_document(input_data, mime_type):
     genai.configure(api_key=GOOGLE_API_KEY)
-    
-    # 【修正箇所】あなたの環境で確実に動くモデル名にしました
-    model_name = "gemini-flash-latest" 
+    model_name = "gemini-1.5-flash" # 高速処理向き
 
     prompt = """
-    以下のレシート・納品書・請求書（画像またはPDF）を読み取り、純粋なJSON形式のみを出力してください。
-    Markdown記法は含めないでください。
+    以下のレシート・納品書・請求書を読み取り、純粋なJSON形式のみを出力してください。
+    Markdown記法は不要です。
     
     【全体情報】
     - date (日付: YYYY-MM-DD)
     - company_name (仕入先・店名)
-    - total_amount (伝票全体の合計金額: 税込み等の最終合計。数値のみ)
-    - invoice_number (インボイス番号: T+数字13桁など。なければnull)
+    - total_amount (伝票合計金額: 数値のみ)
+    - invoice_number (インボイス番号)
     
     【明細リスト (items)】
-    各商品行について、以下の情報を抽出してください。
-    特に「単価(下代)」と「上代」を混同しないように注意してください。
-    
-    - jan_code (JANコード/品番。なければnull)
+    - jan_code (JAN/品番)
     - product_name (商品名)
-    - quantity (数量。数値のみ)
-    - retail_price (上代/定価。記載がなければnull)
-    - wholesale_rate (掛け率。例: 60, 0.6など。記載がなければnull)
-    - cost_price (単価/下代/原単価。これが仕入れ単価になります。数値のみ)
-    - line_total (金額/下代合計/行合計。単価×数量の結果。数値のみ)
+    - quantity (数量: 数値)
+    - cost_price (単価/下代: 数値)
+    - line_total (金額/行合計: 数値)
     """
     
     try:
         model = genai.GenerativeModel(model_name)
         
-        with st.spinner(f"AIが書類を解析中... ({mime_type})"):
-            # PDFと画像で処理を分ける
-            if mime_type == "application/pdf":
-                content_part = {
-                    "mime_type": "application/pdf",
-                    "data": input_data
-                }
-                response = model.generate_content([prompt, content_part], request_options={"timeout": 600})
-            else:
-                response = model.generate_content([prompt, input_data], request_options={"timeout": 600})
+        # API制限回避のための短い待機
+        time.sleep(1) 
 
-            text = response.text
-            cleaned_text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(cleaned_text)
+        if mime_type == "application/pdf":
+            content_part = {"mime_type": "application/pdf", "data": input_data}
+            response = model.generate_content([prompt, content_part])
+        else:
+            response = model.generate_content([prompt, input_data])
+
+        text = response.text
+        cleaned_text = text.replace("```json", "").replace("```", "").strip()
+        return json.loads(cleaned_text)
             
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg:
-            st.error("⚠️ 混雑のためエラーになりました。少し時間をおいて再試行してください。")
-        elif "404" in error_msg:
-            st.error("⚠️ モデルが見つかりません。コード内の model_name を確認してください。")
-        else:
-            st.error(f"エラーが発生しました: {e}")
-        return None
+        return None # エラー時はスキップ
 
 # ==========================================
-# 3. 画面のデザイン (UI)
+# 3. 画面のデザイン (一括処理UI)
 # ==========================================
-st.title("📦 AI仕入れ・経費読み取りくん (PDF対応)")
-st.markdown("レシート(画像)や請求書(PDF)から **JAN・上代・掛け率・単価・金額** を抽出します。")
+st.title("📂 AI伝票一括読み取りシステム")
+st.markdown("フォルダ内のファイルを**まとめてドラッグ＆ドロップ**してください。一気に処理して1つの表にまとめます。")
 
-col1, col2 = st.columns(2)
+# 複数ファイルを受け付ける設定 (accept_multiple_files=True)
+uploaded_files = st.file_uploader(
+    "ここにファイルをまとめて放り込んでください (画像・PDF)", 
+    type=["jpg", "png", "jpeg", "pdf"], 
+    accept_multiple_files=True
+)
 
-with col1:
-    uploaded_file = st.file_uploader("書類をアップロード", type=["jpg", "png", "jpeg", "webp", "pdf"])
-    
-    target_data = None
-    file_type = ""
+if uploaded_files:
+    file_count = len(uploaded_files)
+    st.info(f"📄 {file_count} 件のファイルが選択されました")
 
-    if uploaded_file:
-        if uploaded_file.type == "application/pdf":
-            st.info("📄 PDFファイルが選択されました")
-            target_data = uploaded_file.getvalue()
-            file_type = "application/pdf"
-        else:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="アップロード画像", use_container_width=True)
-            target_data = image
-            file_type = "image"
-
-with col2:
-    if target_data is not None:
-        if st.button("詳細読み取り開始 🚀", use_container_width=True):
-            result_json = analyze_document(target_data, file_type)
+    if st.button(f"一括読み取り開始 ({file_count}件) 🚀", use_container_width=True):
+        
+        # 結果を溜めておくリスト
+        all_rows = []
+        
+        # プログレスバー（進捗状況）を表示
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        
+        # 1つずつ順番に処理
+        for i, file in enumerate(uploaded_files):
+            status_text.text(f"処理中... {i+1} / {file_count} : {file.name}")
             
-            if result_json:
-                st.success("読み取り完了！")
-                
-                # --- データ加工処理 ---
-                header_info = {
-                    "日付": result_json.get("date"),
-                    "仕入先・店名": result_json.get("company_name"),
-                    "インボイスNo": result_json.get("invoice_number"),
-                    "【伝票合計金額】": result_json.get("total_amount"),
-                }
+            # ファイルの種類判定
+            file_bytes = file.getvalue()
+            mime_type = "application/pdf" if file.type == "application/pdf" else "image"
+            if mime_type == "image":
+                file_bytes = Image.open(file)
 
-                rows = []
-                items = result_json.get("items", [])
+            # AI解析実行
+            result = analyze_document(file_bytes, mime_type)
+            
+            if result:
+                # 共通ヘッダー情報
+                header_info = {
+                    "ファイル名": file.name,
+                    "日付": result.get("date"),
+                    "仕入先": result.get("company_name"),
+                    "伝票合計": result.get("total_amount"),
+                    "インボイスNo": result.get("invoice_number"),
+                }
                 
+                # 明細がある場合
+                items = result.get("items", [])
                 if items:
                     for item in items:
                         row = header_info.copy()
@@ -127,34 +118,43 @@ with col2:
                             "JAN/品番": item.get("jan_code"),
                             "商品名": item.get("product_name"),
                             "数量": item.get("quantity"),
-                            "上代(定価)": item.get("retail_price"),
-                            "掛け率": item.get("wholesale_rate"),
                             "単価(下代)": item.get("cost_price"),
                             "金額(行合計)": item.get("line_total")
                         })
-                        rows.append(row)
+                        all_rows.append(row)
                 else:
+                    # 明細なしの場合
                     row = header_info.copy()
                     row.update({"商品名": "（明細なし）"})
-                    rows.append(row)
+                    all_rows.append(row)
+            
+            # 進捗バーを更新
+            progress_bar.progress((i + 1) / file_count)
 
-                df = pd.DataFrame(rows)
-                
-                desired_order = [
-                    "日付", "仕入先・店名", "JAN/品番", "商品名", 
-                    "数量", "上代(定価)", "掛け率", "単価(下代)", "金額(行合計)", 
-                    "【伝票合計金額】", "インボイスNo"
-                ]
-                final_columns = [c for c in desired_order if c in df.columns]
-                df = df[final_columns]
-                
-                st.subheader("解析結果")
-                st.dataframe(df)
-                
-                csv = df.to_csv(index=False).encode('utf-8-sig')
-                st.download_button(
-                    label="CSVデータとして保存 💾",
-                    data=csv,
-                    file_name="document_data.csv",
-                    mime="text/csv",
-                )
+        status_text.success("すべての処理が完了しました！")
+        
+        # --- 結果表示とダウンロード ---
+        if all_rows:
+            df = pd.DataFrame(all_rows)
+            
+            # 列の整理
+            desired_order = [
+                "ファイル名", "日付", "仕入先", "JAN/品番", "商品名", 
+                "数量", "単価(下代)", "金額(行合計)", "伝票合計", "インボイスNo"
+            ]
+            final_columns = [c for c in desired_order if c in df.columns]
+            df = df[final_columns]
+            
+            st.subheader("📊 統合データ")
+            st.dataframe(df)
+            
+            csv = df.to_csv(index=False).encode('utf-8-sig')
+            st.download_button(
+                label="全データをCSVで保存 💾",
+                data=csv,
+                file_name="bulk_data.csv",
+                mime="text/csv",
+                key="download-csv"
+            )
+        else:
+            st.warning("データを読み取れませんでした。")
