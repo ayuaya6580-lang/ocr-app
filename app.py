@@ -11,7 +11,7 @@ import re
 # ==========================================
 # 1. アプリの設定
 # ==========================================
-st.set_page_config(page_title="AI高速・高精度読み取り", layout="wide")
+st.set_page_config(page_title="AI高速・完全読み取り", layout="wide")
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -20,42 +20,49 @@ except:
     st.stop()
 
 # ==========================================
-# 2. 強力なJSON抽出関数（エラー回避の要）
+# 2. JSON抽出・修復関数
 # ==========================================
 def extract_json(text):
     """
-    AIの返答からJSON部分だけを無理やり抜き出す関数
+    AIの返答からJSON部分を抜き出し、多少の壊れなら修復を試みる
     """
     try:
-        # Markdown記法を削除
+        # 余計な文字を削除
         text = text.replace("```json", "").replace("```", "").strip()
         
-        # 波括弧 { } の一番外側を探す（余計な挨拶文をカットするため）
+        # { } の範囲を探す
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if match:
             text = match.group(0)
-            
+        
         return json.loads(text)
     except:
-        return None
+        # 末尾が切れている場合の簡易修復（閉じカッコを補う）
+        try:
+            if text.strip().endswith("]"): 
+                text += "}" 
+            elif text.strip().endswith("}") == False:
+                text += "]}"
+            return json.loads(text)
+        except:
+            return None
 
 # ==========================================
-# 3. 解析を行う関数
+# 3. 解析を行うコア関数
 # ==========================================
-def analyze_chunk(input_data, mime_type, chunk_info):
+def call_ai_api(input_data, mime_type):
     genai.configure(api_key=GOOGLE_API_KEY)
     model_name = "gemini-flash-latest" 
 
     prompt = """
-    以下の請求書・領収書データ（複数ページ）を読み取り、
-    **全てのページに含まれる明細行**を抽出して、1つのJSONリストにまとめてください。
+    以下の請求書・領収書データを読み取り、明細行を抽出してJSONリストにまとめてください。
     
-    出力は必ず以下のJSON形式のみにしてください。解説は不要です。
+    出力形式:
     {
       "items": [
         {
           "date": "YYYY-MM-DD",
-          "company_name": "店名・仕入先",
+          "company_name": "店名",
           "jan_code": "JAN/品番",
           "product_name": "商品名",
           "quantity": "数量(数値)",
@@ -69,15 +76,13 @@ def analyze_chunk(input_data, mime_type, chunk_info):
     }
     """
     
-    # リトライ回数を増やす
-    max_retries = 3
-    for attempt in range(max_retries):
+    model = genai.GenerativeModel(model_name)
+    
+    # リトライロジック
+    for attempt in range(3):
         try:
-            model = genai.GenerativeModel(model_name)
-            
             if mime_type == "application/pdf":
                 content_part = {"mime_type": "application/pdf", "data": input_data}
-                # トークン数を増やして切れにくくする
                 response = model.generate_content(
                     [prompt, content_part], 
                     generation_config={"response_mime_type": "application/json"} 
@@ -87,27 +92,21 @@ def analyze_chunk(input_data, mime_type, chunk_info):
                     [prompt, input_data],
                     generation_config={"response_mime_type": "application/json"}
                 )
-
-            # 強力な抽出関数を通す
-            data = extract_json(response.text)
             
-            if data:
-                return data
-            else:
-                # JSONパース失敗ならリトライ対象にする
-                raise Exception("JSON Parse Error")
-
+            data = extract_json(response.text)
+            if data: return data
+            
         except Exception as e:
-            time.sleep(5 * (attempt + 1)) # 待機時間を少し長めに
+            time.sleep(3 * (attempt + 1)) # エラー時は少し待つ
             continue
             
     return None
 
 # ==========================================
-# 4. 画面のデザイン
+# 4. 画面のデザイン・メイン処理
 # ==========================================
-st.title("⚡ AI高速・高精度読み取り（3ページ束ね処理）")
-st.markdown("エラーを減らすため、**3ページずつ** 確実に処理します。")
+st.title("🛡️ AI高速・完全読み取り（自動リトライ機能付）")
+st.markdown("基本は3ページまとめて高速処理し、**失敗した箇所だけ自動で1ページずつ丁寧に読み直します**。")
 
 uploaded_files = st.file_uploader(
     "ここにファイルをドラッグ＆ドロップ", 
@@ -116,8 +115,6 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    st.info("📄 準備完了。開始ボタンを押してください。")
-
     if st.button(f"読み取り開始 🚀", use_container_width=True):
         
         all_rows = []
@@ -125,104 +122,123 @@ if uploaded_files:
         status_text = st.empty()
         error_log = []
         
+        # 処理タスクの作成
         tasks = []
+        for f in uploaded_files:
+            tasks.append(f)
 
-        # --- 準備フェーズ ---
-        status_text.text("準備中: 最適なサイズに分割しています...")
-        
-        # ★ここが重要：安定重視で「3ページ」に変更
-        CHUNK_SIZE = 3 
-        
-        for file in uploaded_files:
-            if file.type == "application/pdf":
-                try:
-                    pdf_reader = PdfReader(file)
-                    total_pages = len(pdf_reader.pages)
+        total_files = len(tasks)
+
+        for file_idx, file in enumerate(tasks):
+            file_name = file.name
+            
+            # --- 画像の場合 ---
+            if file.type != "application/pdf":
+                status_text.text(f"処理中: {file_name} (画像)...")
+                image = Image.open(file)
+                result = call_ai_api(image, "image")
+                
+                if result:
+                    # データ保存処理
+                    items = result.get("items", []) if isinstance(result, dict) else []
+                    for item in items:
+                        item["ファイル/ページ"] = file_name
+                        all_rows.append(item)
+                else:
+                    error_log.append(f"❌ {file_name} (画像読み取り失敗)")
+                
+                progress_bar.progress((file_idx + 1) / total_files)
+                continue
+
+            # --- PDFの場合（ここが重要） ---
+            try:
+                pdf_reader = PdfReader(file)
+                total_pages = len(pdf_reader.pages)
+                chunk_size = 3 # 基本は3ページずつ
+                
+                for i in range(0, total_pages, chunk_size):
+                    end_page = min(i + chunk_size, total_pages)
+                    page_label = f"{file_name} (p{i+1}-{end_page})"
                     
-                    for i in range(0, total_pages, CHUNK_SIZE):
-                        pdf_writer = PdfWriter()
-                        end_page = min(i + CHUNK_SIZE, total_pages)
+                    status_text.text(f"⚡ 高速処理中: {page_label} ...")
+                    
+                    # 3ページ分のPDFを作成
+                    pdf_writer = PdfWriter()
+                    for p in range(i, end_page):
+                        pdf_writer.add_page(pdf_reader.pages[p])
+                    
+                    chunk_bytes = io.BytesIO()
+                    pdf_writer.write(chunk_bytes)
+                    chunk_data = chunk_bytes.getvalue()
+                    
+                    # ★まずは3ページまとめてトライ！
+                    time.sleep(1) # 少し休憩
+                    result = call_ai_api(chunk_data, "application/pdf")
+                    
+                    if result:
+                        # 成功！
+                        items = result.get("items", []) if isinstance(result, dict) else []
+                        for item in items:
+                            item["ファイル/ページ"] = page_label
+                            all_rows.append(item)
+                    else:
+                        # ★失敗！ここから「1ページずつ再挑戦モード」発動
+                        st.warning(f"⚠️ {page_label} の一括読み取りに失敗。1ページずつ丁寧に読み直します...")
                         
-                        for p in range(i, end_page):
-                            pdf_writer.add_page(pdf_reader.pages[p])
-                        
-                        with io.BytesIO() as output_stream:
-                            pdf_writer.write(output_stream)
-                            chunk_bytes = output_stream.getvalue()
+                        for retry_p in range(i, end_page):
+                            single_label = f"{file_name} (p{retry_p+1})"
+                            status_text.text(f"🐢 救済処理中: {single_label} ...")
                             
-                            label = f"{file.name} (p{i+1}-{end_page})"
-                            tasks.append({
-                                "data": chunk_bytes,
-                                "mime": "application/pdf",
-                                "label": label
-                            })
-                except:
-                    error_log.append(f"{file.name} 読み込み失敗")
-            else:
-                tasks.append({
-                    "data": Image.open(file),
-                    "mime": "image",
-                    "label": file.name
-                })
+                            # 1ページだけのPDF作成
+                            single_writer = PdfWriter()
+                            single_writer.add_page(pdf_reader.pages[retry_p])
+                            single_bytes = io.BytesIO()
+                            single_writer.write(single_bytes)
+                            
+                            time.sleep(2) # 念入りに休憩
+                            single_result = call_ai_api(single_bytes.getvalue(), "application/pdf")
+                            
+                            if single_result:
+                                items = single_result.get("items", []) if isinstance(single_result, dict) else []
+                                for item in items:
+                                    item["ファイル/ページ"] = single_label
+                                    all_rows.append(item)
+                            else:
+                                error_log.append(f"❌ {single_label} (完全読み取り不可)")
 
-        # --- 実行フェーズ ---
-        total_tasks = len(tasks)
-        st.write(f"全 {total_tasks} 束の処理を開始します...")
+            except Exception as e:
+                error_log.append(f"❌ {file_name} 全体エラー: {e}")
 
-        for idx, task in enumerate(tasks):
-            status_text.text(f"🔍 解析中... {idx+1}/{total_tasks} : {task['label']}")
-            
-            # API制限対策（3ページごとなので少し休憩）
-            time.sleep(2) 
+            progress_bar.progress((file_idx + 1) / total_files)
 
-            result = analyze_chunk(task['data'], task['mime'], task['label'])
-            
-            if result:
-                items_list = []
-                if isinstance(result, list):
-                    items_list = result
-                elif isinstance(result, dict):
-                    items_list = result.get("items", [])
-                    if not items_list and "product_name" in result:
-                        items_list = [result]
-
-                if items_list:
-                    for item in items_list:
-                        row = {
-                            "ファイル/ページ": task['label'],
-                            "日付": item.get("date"),
-                            "仕入先": item.get("company_name"),
-                            "JAN/品番": item.get("jan_code"),
-                            "商品名": item.get("product_name"),
-                            "数量": item.get("quantity"),
-                            "上代": item.get("retail_price"),
-                            "単価(下代)": item.get("cost_price"),
-                            "金額(行合計)": item.get("line_total"),
-                            "掛け率": item.get("wholesale_rate"),
-                            "インボイスNo": item.get("invoice_number")
-                        }
-                        all_rows.append(row)
-            else:
-                error_log.append(f"{task['label']} - 読み取り失敗")
-
-            progress_bar.progress((idx + 1) / total_tasks)
-
-        status_text.success("完了しました！")
+        status_text.success("すべての処理が完了しました！")
 
         if error_log:
-            with st.expander(f"⚠️ {len(error_log)}件のエラーがありました"):
+            with st.expander(f"⚠️ 最終的に読み取れなかった箇所 ({len(error_log)}件)"):
                 for err in error_log:
                     st.write(err)
             
         if all_rows:
+            # データフレーム作成と整形
             df = pd.DataFrame(all_rows)
             
-            desired_order = [
-                "ファイル/ページ", "日付", "仕入先", "JAN/品番", "商品名", 
-                "数量", "上代", "掛け率", "単価(下代)", "金額(行合計)", "インボイスNo"
+            # 列の存在確認をしてから並べ替え
+            cols = [
+                "ファイル/ページ", "date", "company_name", "jan_code", "product_name", 
+                "quantity", "retail_price", "wholesale_rate", "cost_price", "line_total", "invoice_number"
             ]
-            final_columns = [c for c in desired_order if c in df.columns]
-            df = df[final_columns]
+            # 日本語表記へのマッピング
+            col_map = {
+                "date": "日付", "company_name": "仕入先", "jan_code": "JAN/品番", 
+                "product_name": "商品名", "quantity": "数量", "retail_price": "上代", 
+                "wholesale_rate": "掛け率", "cost_price": "単価(下代)", 
+                "line_total": "金額(行合計)", "invoice_number": "インボイスNo"
+            }
+            
+            # 存在する列だけ残す
+            existing_cols = [c for c in cols if c in df.columns]
+            df = df[existing_cols]
+            df = df.rename(columns=col_map)
             
             st.subheader(f"📊 抽出データ ({len(df)}行)")
             st.dataframe(df)
@@ -231,8 +247,8 @@ if uploaded_files:
             st.download_button(
                 label="CSV保存 💾",
                 data=csv,
-                file_name="high_accuracy_data.csv",
+                file_name="final_data.csv",
                 mime="text/csv"
             )
         else:
-            st.warning("データを抽出できませんでした。")
+            st.error("データを1件も抽出できませんでした。")
