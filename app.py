@@ -4,149 +4,87 @@ from PIL import Image
 import json
 import pandas as pd
 import time
-import re
 
 # ==========================================
 # 1. アプリの設定
 # ==========================================
-st.set_page_config(page_title="AI一括伝票読み取り（診断モード）", layout="wide")
+st.set_page_config(page_title="AI一括伝票読み取り（完全版）", layout="wide")
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except:
-    st.error("❌ APIキーが設定されていません。Secretsを確認してください。")
+    st.error("❌ APIキーが設定されていません。StreamlitのSecretsを設定してください。")
     st.stop()
 
 # ==========================================
-# 2. 解析を行う関数（エラー内容を表示する版）
+# 2. 解析を行う関数（修正版）
 # ==========================================
-def analyze_document_debug(input_data, mime_type):
+def analyze_document_safe(input_data, mime_type):
     genai.configure(api_key=GOOGLE_API_KEY)
     
-    # モデル設定（まずは安定版を指定）
-    model_name = "gemini-1.5-flash"
+    # 【重要】あなたの環境で確実に動くモデル名に修正しました
+    model_name = "gemini-flash-latest" 
 
     prompt = """
-    あなたは経理アシスタントです。
-    以下の画像を読み取り、純粋なJSONデータのみを返してください。
-    解説やMarkdown（```json 等）は一切不要です。
+    以下のレシート・納品書・請求書を読み取り、純粋なJSON形式のみを出力してください。
+    Markdown記法（```json 等）は含めないでください。
     
-    出力フォーマット:
-    {
-        "date": "YYYY-MM-DD",
-        "company_name": "店名",
-        "total_amount": "数値",
-        "invoice_number": "T番号",
-        "items": [
-            {
-                "product_name": "商品名",
-                "quantity": "数量",
-                "cost_price": "単価",
-                "line_total": "金額"
-            }
-        ]
-    }
+    【全体情報】
+    - date (日付: YYYY-MM-DD)
+    - company_name (仕入先・店名)
+    - total_amount (伝票合計金額: 数値のみ)
+    - invoice_number (インボイス番号)
+    
+    【明細リスト (items)】
+    - jan_code (JAN/品番)
+    - product_name (商品名)
+    - quantity (数量: 数値)
+    - retail_price (上代/定価: 数値)
+    - cost_price (単価/下代: 数値)
+    - line_total (金額/行合計: 数値)
+    - wholesale_rate (掛け率)
     """
     
-    model = genai.GenerativeModel(model_name)
+    # リトライ回数（エラーが出たら3回まで粘る）
+    max_retries = 3
     
-    try:
-        # 画像かPDFかでデータを準備
-        if mime_type == "application/pdf":
-            content_part = {"mime_type": "application/pdf", "data": input_data}
-            response = model.generate_content([prompt, content_part])
-        else:
-            response = model.generate_content([prompt, input_data])
+    for attempt in range(max_retries):
+        try:
+            model = genai.GenerativeModel(model_name)
+            
+            # PDFと画像で処理を分ける
+            if mime_type == "application/pdf":
+                content_part = {"mime_type": "application/pdf", "data": input_data}
+                response = model.generate_content([prompt, content_part], request_options={"timeout": 600})
+            else:
+                response = model.generate_content([prompt, input_data], request_options={"timeout": 600})
 
-        text = response.text
-        
-        # --- ここから診断用ロジック ---
-        # AIの生出力をデバッグ表示（開発者用）
-        # print(f"AI Raw Output: {text}") 
+            text = response.text
+            # JSONをきれいに取り出す処理
+            cleaned_text = text.replace("```json", "").replace("```", "").strip()
+            return json.loads(cleaned_text)
 
-        # JSONクリーニング（強力版）
-        # ```json や ``` を削除
-        cleaned_text = re.sub(r"```json|```", "", text).strip()
-        
-        # 波カッコ { } の範囲だけを無理やり抽出する（余計な文字対策）
-        match = re.search(r"\{.*\}", cleaned_text, re.DOTALL)
-        if match:
-            cleaned_text = match.group(0)
-        
-        return json.loads(cleaned_text)
-
-    except Exception as e:
-        # ★ここでエラーの正体を画面に出す！
-        st.error(f"⚠️ 詳細エラー: {e}")
-        # もしJSON変換エラーなら、AIが何を言っていたかを表示
-        if "Expecting value" in str(e) or "JSONDecodeError" in str(e):
-             st.warning(f"AIの返答がJSONではありませんでした:\n{text}")
-        return None
+        except Exception as e:
+            error_msg = str(e)
+            # 「429 (混雑)」や「503 (サーバーダウン)」なら待って再開
+            if "429" in error_msg or "503" in error_msg:
+                wait_time = 10 * (attempt + 1) # 10秒、20秒、30秒と待つ時間を増やす
+                time.sleep(wait_time)
+                continue # もう一回トライ！
+            elif "404" in error_msg:
+                 # モデル名が間違っている場合
+                 st.error(f"モデルが見つかりません。コード内の model_name を確認してください。")
+                 return None
+            else:
+                # それ以外のエラーなら今回は諦める
+                return None
+    
+    return None # 3回やってもダメなら諦める
 
 # ==========================================
 # 3. 画面のデザイン
 # ==========================================
-st.title("🩺 AI一括読み取り（エラー診断モード）")
-st.markdown("エラーの詳細を画面に表示します。")
+st.title("📂 AI伝票一括読み取りシステム")
+st.markdown(f"設定モデル: `gemini-flash-latest` (PDF/画像 対応)")
 
-uploaded_files = st.file_uploader(
-    "ファイルをアップロードしてください", 
-    type=["jpg", "png", "jpeg", "pdf"], 
-    accept_multiple_files=True
-)
-
-if uploaded_files:
-    file_count = len(uploaded_files)
-    
-    if st.button(f"診断読み取り開始 ({file_count}件) 🚀", use_container_width=True):
-        
-        all_rows = []
-        progress_bar = st.progress(0)
-        
-        for i, file in enumerate(uploaded_files):
-            st.write(f"🔍 解析中: {file.name} ...")
-            
-            # 休憩（API制限対策）
-            time.sleep(2)
-
-            try:
-                file_bytes = file.getvalue()
-                mime_type = "application/pdf" if file.type == "application/pdf" else "image"
-                if mime_type == "image":
-                    file_bytes = Image.open(file)
-                
-                result = analyze_document_debug(file_bytes, mime_type)
-                
-                if result:
-                    st.success(f"✅ 成功: {file.name}")
-                    # データ加工（簡易版）
-                    header_info = {
-                        "ファイル名": file.name,
-                        "日付": result.get("date"),
-                        "仕入先": result.get("company_name"),
-                        "合計": result.get("total_amount")
-                    }
-                    items = result.get("items", [])
-                    if items:
-                        for item in items:
-                            row = header_info.copy()
-                            row.update(item)
-                            all_rows.append(row)
-                    else:
-                        all_rows.append(header_info)
-                else:
-                    st.error(f"❌ 失敗: {file.name}（上記のエラー詳細を確認してください）")
-            
-            except Exception as e:
-                st.error(f"❌ ファイル読み込みエラー: {file.name} / {e}")
-
-            progress_bar.progress((i + 1) / file_count)
-
-        # --- 結果表示 ---
-        if all_rows:
-            df = pd.DataFrame(all_rows)
-            st.dataframe(df)
-            csv = df.to_csv(index=False).encode('utf-8-sig')
-            st.download_button("CSV保存", csv, "debug_data.csv", "text/csv")
-        else:
-            st.error("データを読み取れませんでした。")
+uploaded_files = st.file_uploader
