@@ -115,7 +115,7 @@ if uploaded_files:
                     total_pages = len(pdf_reader.pages)
                     
                     # 5ページずつループ
-                    chunk_size = 5
+                    chunk_size = 10
                     for i in range(0, total_pages, chunk_size):
                         # 新しいPDFを作る
                         pdf_writer = PdfWriter()
@@ -226,3 +226,4 @@ if uploaded_files:
             )
         else:
             st.warning("データを抽出できませんでした。")
+
