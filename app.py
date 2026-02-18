@@ -10,7 +10,7 @@ import time
 # ==========================================
 st.set_page_config(page_title="AI一括伝票読み取り", layout="wide")
 
-# APIキーの読み込み（金庫から）
+# APIキーの読み込み
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except:
@@ -18,18 +18,18 @@ except:
     st.stop()
 
 # ==========================================
-# 2. 解析を行う関数（裏方の処理）
+# 2. 解析を行う関数
 # ==========================================
 def analyze_document_safe(input_data, mime_type):
-    # API設定
     genai.configure(api_key=GOOGLE_API_KEY)
     
-    # ★あなたの環境で動くモデル名
+    # モデル設定
     model_name = "gemini-flash-latest" 
 
     prompt = """
     以下のレシート・納品書・請求書を読み取り、純粋なJSON形式のみを出力してください。
     Markdown記法（```json 等）は含めないでください。
+    必ず { ... } で始まる単一のオブジェクトを返してください。
     
     【全体情報】
     - date (日付: YYYY-MM-DD)
@@ -47,14 +47,11 @@ def analyze_document_safe(input_data, mime_type):
     - wholesale_rate (掛け率)
     """
     
-    # エラー時の再挑戦回数
     max_retries = 3
-    
     for attempt in range(max_retries):
         try:
             model = genai.GenerativeModel(model_name)
             
-            # PDFと画像でデータの渡し方を変える
             if mime_type == "application/pdf":
                 content_part = {"mime_type": "application/pdf", "data": input_data}
                 response = model.generate_content([prompt, content_part], request_options={"timeout": 600})
@@ -62,12 +59,13 @@ def analyze_document_safe(input_data, mime_type):
                 response = model.generate_content([prompt, input_data], request_options={"timeout": 600})
 
             text = response.text
-            # JSON整形
             cleaned_text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(cleaned_text)
+            
+            # JSON変換
+            data = json.loads(cleaned_text)
+            return data
 
         except Exception as e:
-            # 混雑エラーなら待機
             error_msg = str(e)
             if "429" in error_msg or "503" in error_msg:
                 time.sleep(10 * (attempt + 1))
@@ -76,25 +74,20 @@ def analyze_document_safe(input_data, mime_type):
                  return None
             else:
                 return None
-    
     return None
 
 # ==========================================
-# 3. 画面のデザイン (UI)
+# 3. 画面のデザイン
 # ==========================================
-# ★ここからインデントを戻します（左端に寄せる）
-
 st.title("📂 AI伝票一括読み取りシステム")
 st.markdown("フォルダ内のファイルを**まとめてドラッグ＆ドロップ**してください。")
 
-# ★ここが「口」を作る部分です
 uploaded_files = st.file_uploader(
     "ここにファイルをまとめて放り込んでください (画像・PDF)", 
     type=["jpg", "png", "jpeg", "pdf"], 
     accept_multiple_files=True
 )
 
-# ファイルがアップロードされたら処理開始ボタンを出す
 if uploaded_files:
     file_count = len(uploaded_files)
     st.info(f"📄 {file_count} 件のファイルがセットされました")
@@ -106,25 +99,30 @@ if uploaded_files:
         status_text = st.empty()
         error_log = []
         
-        # 1つずつ処理
         for i, file in enumerate(uploaded_files):
             status_text.text(f"⏳ 処理中... {i+1}/{file_count} : {file.name}")
-            
-            # 安全のため3秒休憩
-            time.sleep(3)
+            time.sleep(3) # 休憩
 
             try:
-                # ファイルの準備
+                # データ準備
                 file_bytes = file.getvalue()
                 mime_type = "application/pdf" if file.type == "application/pdf" else "image"
                 if mime_type == "image":
                     file_bytes = Image.open(file)
                 
-                # AI解析実行
                 result = analyze_document_safe(file_bytes, mime_type)
                 
+                # ★★★ ここが修正ポイント！ ★★★
+                # もしAIが「リスト(配列)」で返してきたら、中身を取り出してあげる
+                if isinstance(result, list):
+                    if len(result) > 0:
+                        result = result[0] # 最初の1個を使う
+                    else:
+                        result = None # 空っぽなら無視
+                # ★★★★★★★★★★★★★★★★★★★
+
                 if result:
-                    # 成功データの保存
+                    # ヘッダー情報
                     header_info = {
                         "ファイル名": file.name,
                         "日付": result.get("date"),
@@ -156,12 +154,10 @@ if uploaded_files:
             except Exception as e:
                 error_log.append(f"{file.name} (エラー: {e})")
 
-            # 進捗バー更新
             progress_bar.progress((i + 1) / file_count)
 
         status_text.success("完了！")
 
-        # 結果表示
         if error_log:
             with st.expander("⚠️ エラーがあったファイル"):
                 for err in error_log:
@@ -170,7 +166,6 @@ if uploaded_files:
         if all_rows:
             df = pd.DataFrame(all_rows)
             
-            # 列の整理
             desired_order = [
                 "ファイル名", "日付", "仕入先", "JAN/品番", "商品名", 
                 "数量", "上代", "掛け率", "単価(下代)", "金額(行合計)", "伝票合計", "インボイスNo"
