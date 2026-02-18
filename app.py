@@ -10,42 +10,45 @@ import io
 # ==========================================
 # 1. アプリの設定
 # ==========================================
-st.set_page_config(page_title="AI一括伝票読み取り", layout="wide")
+st.set_page_config(page_title="AI高速一括読み取り", layout="wide")
 
-# APIキーの読み込み
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
 except:
-    st.error("❌ APIキーが設定されていません。StreamlitのSecretsを設定してください。")
+    st.error("❌ APIキーが設定されていません。")
     st.stop()
 
 # ==========================================
-# 2. 解析を行う関数（単一ページ処理用）
+# 2. 解析を行う関数（5ページまとめて処理）
 # ==========================================
-def analyze_page(input_data, mime_type, page_label):
+def analyze_chunk(input_data, mime_type, chunk_info):
     genai.configure(api_key=GOOGLE_API_KEY)
     model_name = "gemini-flash-latest" 
 
+    # 複数ページをまとめて処理するためのプロンプト
     prompt = """
-    以下のレシート・請求書データを読み取り、純粋なJSON形式のみを出力してください。
-    Markdown記法（```json 等）は含めないでください。
-    必ず { ... } で始まる単一のオブジェクトを返してください。
+    以下の請求書・領収書データ（複数ページの場合あり）を読み取り、
+    **全てのページに含まれる明細行**を抽出して、1つのJSONリストにまとめてください。
     
-    【全体情報】
-    - date (日付: YYYY-MM-DD)
-    - company_name (仕入先・店名)
-    - total_amount (伝票合計金額: 数値のみ)
-    - invoice_number (インボイス番号)
-    
-    【明細リスト (items)】
-    表に含まれる全ての商品行を抽出してください。
-    - jan_code (JAN/品番)
-    - product_name (商品名)
-    - quantity (数量: 数値)
-    - retail_price (上代/定価: 数値)
-    - cost_price (単価/下代: 数値)
-    - line_total (金額/行合計: 数値)
-    - wholesale_rate (掛け率)
+    Markdown記法（```json 等）は不要です。
+    出力形式:
+    {
+      "items": [
+        {
+          "date": "YYYY-MM-DD",
+          "company_name": "店名・仕入先",
+          "jan_code": "JAN/品番",
+          "product_name": "商品名",
+          "quantity": "数量(数値)",
+          "retail_price": "上代(数値)",
+          "cost_price": "単価/下代(数値)",
+          "line_total": "行合計(数値)",
+          "wholesale_rate": "掛け率",
+          "invoice_number": "インボイス番号"
+        },
+        ... (全明細を列挙)
+      ]
+    }
     """
     
     max_retries = 3
@@ -62,184 +65,164 @@ def analyze_page(input_data, mime_type, page_label):
             text = response.text
             cleaned_text = text.replace("```json", "").replace("```", "").strip()
             
-            # JSON変換トライ
-            return json.loads(cleaned_text)
+            # JSON変換
+            data = json.loads(cleaned_text)
+            return data
 
         except Exception as e:
             error_msg = str(e)
             if "429" in error_msg or "503" in error_msg:
-                wait = 10 * (attempt + 1)
+                wait = 15 * (attempt + 1) # 混雑時は少し長めに待つ
                 time.sleep(wait)
                 continue
-            else:
-                # 致命的なエラー以外はNoneを返して次へ
-                return None
+            return None
     return None
 
 # ==========================================
 # 3. 画面のデザイン
 # ==========================================
-st.title("📂 AI伝票一括読み取り（全ページ分割処理版）")
-st.markdown("PDFが複数ページある場合、**1ページずつ自動で切り離して**解析します。")
+st.title("⚡ AI高速一括読み取り（5ページ同時処理）")
+st.markdown("135ページのような大量データも、**5ページずつ束ねて処理**することで高速化します。")
 
 uploaded_files = st.file_uploader(
-    "ここにファイルをまとめて放り込んでください (画像・PDF)", 
-    type=["jpg", "png", "jpeg", "pdf"], 
+    "ここにファイルをドラッグ＆ドロップ (PDF推奨)", 
+    type=["pdf", "jpg", "png"], 
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    file_count = len(uploaded_files)
-    st.info(f"📄 {file_count} 件のファイルがセットされました")
+    # ファイル数というより、PDFの中身が重要なので確認
+    st.info("📄 ファイルがセットされました。開始ボタンを押すと高速解析します。")
 
-    if st.button(f"読み取り開始 🚀", use_container_width=True):
+    if st.button(f"高速読み取り開始 🚀", use_container_width=True):
         
         all_rows = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         error_log = []
         
-        # 全体の進捗計算用（ファイル数ではなく、ページ総数で考えたいが、まずは簡易的に）
-        total_steps = file_count
-        current_step = 0
+        # 処理対象の全チャンクを作成するリスト
+        # [ (pdf_bytes, "filename_p1-5"), (pdf_bytes, "filename_p6-10")... ]
+        tasks = []
 
-        for file_index, file in enumerate(uploaded_files):
-            file_name = file.name
-            mime_type = "application/pdf" if file.type == "application/pdf" else "image"
-            
-            # --- PDFの場合：ページごとに分解してループ ---
-            if mime_type == "application/pdf":
+        # --- 準備フェーズ：PDFを5ページごとに分割する ---
+        status_text.text("準備中: ページを切り分けています...")
+        
+        for file in uploaded_files:
+            if file.type == "application/pdf":
                 try:
                     pdf_reader = PdfReader(file)
-                    num_pages = len(pdf_reader.pages)
+                    total_pages = len(pdf_reader.pages)
                     
-                    status_text.text(f"処理中: {file_name} (全{num_pages}ページ)...")
-                    
-                    for page_num in range(num_pages):
-                        # 進捗表示詳細
-                        status_text.text(f"処理中: {file_name} - {page_num+1} / {num_pages} ページ目 ⏳")
-                        
-                        # 1ページだけ取り出して新しいPDFデータ(bytes)を作る
+                    # 5ページずつループ
+                    chunk_size = 5
+                    for i in range(0, total_pages, chunk_size):
+                        # 新しいPDFを作る
                         pdf_writer = PdfWriter()
-                        pdf_writer.add_page(pdf_reader.pages[page_num])
+                        # i番目から、i+5番目まで（または最後まで）を追加
+                        end_page = min(i + chunk_size, total_pages)
                         
+                        for p in range(i, end_page):
+                            pdf_writer.add_page(pdf_reader.pages[p])
+                        
+                        # バイトデータに変換
                         with io.BytesIO() as output_stream:
                             pdf_writer.write(output_stream)
-                            page_bytes = output_stream.getvalue()
+                            chunk_bytes = output_stream.getvalue()
                             
-                            # ここでAIに送信！
-                            time.sleep(2) # 休憩
-                            result = analyze_page(page_bytes, "application/pdf", f"{file_name}_p{page_num+1}")
-                            
-                            # 結果の保存処理
-                            if isinstance(result, list): # リスト対策
-                                result = result[0] if len(result) > 0 else None
-
-                            if result:
-                                header_info = {
-                                    "ファイル名": f"{file_name} (p{page_num+1})",
-                                    "日付": result.get("date"),
-                                    "仕入先": result.get("company_name"),
-                                    "伝票合計": result.get("total_amount"),
-                                    "インボイスNo": result.get("invoice_number"),
-                                }
-                                items = result.get("items", [])
-                                if items:
-                                    for item in items:
-                                        row = header_info.copy()
-                                        row.update({
-                                            "JAN/品番": item.get("jan_code"),
-                                            "商品名": item.get("product_name"),
-                                            "数量": item.get("quantity"),
-                                            "上代": item.get("retail_price"),
-                                            "単価(下代)": item.get("cost_price"),
-                                            "金額(行合計)": item.get("line_total"),
-                                            "掛け率": item.get("wholesale_rate")
-                                        })
-                                        all_rows.append(row)
-                                else:
-                                    row = header_info.copy()
-                                    row.update({"商品名": "（明細なし）"})
-                                    all_rows.append(row)
-                            else:
-                                error_log.append(f"{file_name} (p{page_num+1}) - 読み取り失敗")
-
-                except Exception as e:
-                    error_log.append(f"{file_name} - PDF処理エラー: {e}")
-
-            # --- 画像の場合：そのまま処理 ---
+                            label = f"{file.name} (p{i+1}-{end_page})"
+                            tasks.append({
+                                "data": chunk_bytes,
+                                "mime": "application/pdf",
+                                "label": label
+                            })
+                except:
+                    error_log.append(f"{file.name} の読み込みに失敗")
             else:
-                status_text.text(f"処理中: {file_name} (画像)...")
-                time.sleep(2)
-                try:
-                    image = Image.open(file)
-                    result = analyze_page(image, "image", file_name)
-                    
-                    if isinstance(result, list):
-                        result = result[0] if len(result) > 0 else None
+                # 画像の場合はそのまま1つとして扱う
+                tasks.append({
+                    "data": Image.open(file),
+                    "mime": "image",
+                    "label": file.name
+                })
 
-                    if result:
-                        header_info = {
-                            "ファイル名": file_name,
-                            "日付": result.get("date"),
-                            "仕入先": result.get("company_name"),
-                            "伝票合計": result.get("total_amount"),
-                            "インボイスNo": result.get("invoice_number"),
+        # --- 実行フェーズ ---
+        total_tasks = len(tasks)
+        st.write(f"合計 {total_tasks} 回のAI解析を実行します...")
+
+        for idx, task in enumerate(tasks):
+            status_text.text(f"🔥 高速解析中... {idx+1}/{total_tasks} : {task['label']}")
+            
+            # API制限対策の短い休憩（5ページごとなので頻度は低い）
+            time.sleep(3) 
+
+            result = analyze_chunk(task['data'], task['mime'], task['label'])
+            
+            # 結果の取り出し
+            if result:
+                # リスト形式で返ってくるか、辞書の中の"items"かを確認
+                items_list = []
+                if isinstance(result, list):
+                    items_list = result
+                elif isinstance(result, dict):
+                    items_list = result.get("items", [])
+                    # もしitemsがなく、直下にデータがある場合の保険
+                    if not items_list and "product_name" in result:
+                        items_list = [result]
+
+                if items_list:
+                    for item in items_list:
+                        # 必要な項目を整理して追加
+                        row = {
+                            "ファイル/ページ": task['label'],
+                            "日付": item.get("date"),
+                            "仕入先": item.get("company_name"),
+                            "JAN/品番": item.get("jan_code"),
+                            "商品名": item.get("product_name"),
+                            "数量": item.get("quantity"),
+                            "上代": item.get("retail_price"),
+                            "単価(下代)": item.get("cost_price"),
+                            "金額(行合計)": item.get("line_total"),
+                            "掛け率": item.get("wholesale_rate"),
+                            "インボイスNo": item.get("invoice_number")
                         }
-                        items = result.get("items", [])
-                        if items:
-                            for item in items:
-                                row = header_info.copy()
-                                row.update({
-                                    "JAN/品番": item.get("jan_code"),
-                                    "商品名": item.get("product_name"),
-                                    "数量": item.get("quantity"),
-                                    "上代": item.get("retail_price"),
-                                    "単価(下代)": item.get("cost_price"),
-                                    "金額(行合計)": item.get("line_total"),
-                                    "掛け率": item.get("wholesale_rate")
-                                })
-                                all_rows.append(row)
-                        else:
-                            row = header_info.copy()
-                            row.update({"商品名": "（明細なし）"})
-                            all_rows.append(row)
-                    else:
-                        error_log.append(f"{file_name} - 読み取り失敗")
-                except Exception as e:
-                    error_log.append(f"{file_name} - 画像エラー: {e}")
+                        all_rows.append(row)
+                else:
+                    # データなし（明細がなかったページなど）
+                    pass
+            else:
+                error_log.append(f"{task['label']} - 解析失敗")
 
-            # プログレスバー更新
-            current_step += 1
-            progress_bar.progress(current_step / total_steps)
+            progress_bar.progress((idx + 1) / total_tasks)
 
-        status_text.success("すべての処理が完了しました！")
+        status_text.success("✅ 完了しました！")
 
         # 結果表示
         if error_log:
-            with st.expander("⚠️ 読み取れなかったページ"):
+            with st.expander("⚠️ うまく読めなかった箇所"):
                 for err in error_log:
                     st.write(err)
             
         if all_rows:
             df = pd.DataFrame(all_rows)
             
+            # 列の並び替え
             desired_order = [
-                "ファイル名", "日付", "仕入先", "JAN/品番", "商品名", 
-                "数量", "上代", "掛け率", "単価(下代)", "金額(行合計)", "伝票合計", "インボイスNo"
+                "ファイル/ページ", "日付", "仕入先", "JAN/品番", "商品名", 
+                "数量", "上代", "掛け率", "単価(下代)", "金額(行合計)", "インボイスNo"
             ]
             final_columns = [c for c in desired_order if c in df.columns]
             df = df[final_columns]
             
-            st.subheader("📊 統合データ")
+            st.subheader(f"📊 抽出データ ({len(df)}行)")
             st.dataframe(df)
             
             csv = df.to_csv(index=False).encode('utf-8-sig')
             st.download_button(
                 label="CSV保存 💾",
                 data=csv,
-                file_name="bulk_data_pages.csv",
+                file_name="fast_bulk_data.csv",
                 mime="text/csv"
             )
         else:
-            st.error("データを読み取れませんでした。")
+            st.warning("データを抽出できませんでした。")
