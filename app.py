@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. アプリの設定
 # ==========================================
-st.set_page_config(page_title="AI並列高速読み取り", layout="wide")
+st.set_page_config(page_title="AI並列高速読み取り(安定版)", layout="wide")
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -20,15 +20,15 @@ except:
     st.stop()
 
 # ==========================================
-# 2. 解析を行う関数（1ページ単位）
+# 2. 解析を行う関数（1ページ単位・強力リトライ付）
 # ==========================================
 def analyze_single_page(page_data, page_label, mime_type="application/pdf"):
     genai.configure(api_key=GOOGLE_API_KEY)
-    model_name = "gemini-flash-latest" 
+    # 安定動作するモデルを指定
+    model_name = "gemini-1.5-flash" 
 
     prompt = """
     この伝票画像の**明細行のみ**を抽出し、以下のJSON形式で出力してください。
-    余計な解説は不要です。
     
     {
       "items": [
@@ -48,8 +48,10 @@ def analyze_single_page(page_data, page_label, mime_type="application/pdf"):
     
     model = genai.GenerativeModel(model_name)
     
-    # リトライ回数
-    for attempt in range(3):
+    # リトライ回数（最大5回まで粘る）
+    max_retries = 5
+    
+    for attempt in range(max_retries):
         try:
             # データ送信
             if mime_type == "application/pdf":
@@ -64,23 +66,30 @@ def analyze_single_page(page_data, page_label, mime_type="application/pdf"):
                     generation_config={"response_mime_type": "application/json"}
                 )
 
-            # JSON抽出
-            text = response.text
-            # 万が一Markdownが残っていた場合のクリーニング
-            text = text.replace("```json", "").replace("```", "").strip()
-            return json.loads(text)
+            return json.loads(response.text)
 
-        except Exception:
-            time.sleep(2 * (attempt + 1)) # エラー時は少し待機して再試行
-            continue
+        except Exception as e:
+            error_msg = str(e)
+            # 「429 (使いすぎ)」エラーが出たら、長く休憩して再開
+            if "429" in error_msg or "ResourceExhausted" in error_msg:
+                wait_time = 20 * (attempt + 1) # 20秒, 40秒...と待機時間を増やす
+                time.sleep(wait_time)
+                continue # 再トライ
+            elif attempt < max_retries - 1:
+                # その他のエラーも少し待って再トライ
+                time.sleep(5)
+                continue
+            else:
+                # 最後までダメだった場合、エラー理由を返す
+                return {"error": f"{error_msg}"}
             
     return None
 
 # ==========================================
 # 3. メイン処理（並列実行）
 # ==========================================
-st.title("🚀 AI並列高速読み取りシステム")
-st.markdown("1ページずつ確実に、かつ**複数ページ同時に**処理することで、大量の明細も高速に読み取ります。")
+st.title("🛡️ AI並列高速読み取り（安定版）")
+st.markdown("速度を調整しながら、エラーが出ても**自動で待機・再開**して最後まで読み切ります。")
 
 uploaded_files = st.file_uploader(
     "ここにファイルをドラッグ＆ドロップ", 
@@ -96,7 +105,6 @@ if uploaded_files:
         status_text = st.empty()
         error_log = []
         
-        # 処理タスクのリスト作成
         tasks = []
         
         # --- 準備：全ページをタスクに分解 ---
@@ -107,7 +115,6 @@ if uploaded_files:
                 try:
                     pdf_reader = PdfReader(file)
                     for i, page in enumerate(pdf_reader.pages):
-                        # 1ページずつ切り出す
                         pdf_writer = PdfWriter()
                         pdf_writer.add_page(page)
                         with io.BytesIO() as output:
@@ -122,7 +129,6 @@ if uploaded_files:
                 except:
                     error_log.append(f"{file.name} の読み込みに失敗")
             else:
-                # 画像の場合
                 tasks.append({
                     "data": Image.open(file),
                     "label": file.name,
@@ -130,12 +136,11 @@ if uploaded_files:
                 })
 
         total_tasks = len(tasks)
-        st.write(f"合計 {total_tasks} ページを並列処理します...")
+        st.write(f"合計 {total_tasks} ページを処理します...")
 
         # --- 並列実行フェーズ ---
-        # max_workers=4 : 同時に4ページずつ処理（API制限ギリギリを攻める設定）
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            # タスクを登録
+        # ★重要：並列数を2に制限して、API制限を回避する
+        with ThreadPoolExecutor(max_workers=2) as executor:
             future_to_task = {
                 executor.submit(analyze_single_page, t["data"], t["label"], t["mime"]): t 
                 for t in tasks
@@ -143,23 +148,25 @@ if uploaded_files:
             
             completed_count = 0
             
-            # 完了したものから順次処理
             for future in as_completed(future_to_task):
                 task = future_to_task[future]
                 completed_count += 1
                 
-                # 進捗表示
                 status_text.text(f"処理中... {completed_count}/{total_tasks} 完了 ({task['label']})")
                 progress_bar.progress(completed_count / total_tasks)
                 
                 try:
                     result = future.result()
-                    if result:
+                    
+                    # エラーメッセージが返ってきた場合
+                    if isinstance(result, dict) and "error" in result:
+                        error_log.append(f"{task['label']} - {result['error']}")
+                    
+                    # 正常にアイテムが返ってきた場合
+                    elif result and "items" in result:
                         items = result.get("items", [])
-                        # 明細がない場合でもファイル名だけは記録に残すか、スキップするか
                         if items:
                             for item in items:
-                                # 必要な列を整理
                                 row = {
                                     "ページ": task['label'],
                                     "日付": item.get("date"),
@@ -174,7 +181,9 @@ if uploaded_files:
                                 }
                                 all_rows.append(row)
                     else:
-                        error_log.append(f"{task['label']} - 読み取り失敗")
+                        # 明細なし、または空の結果
+                        pass
+                        
                 except Exception as e:
                     error_log.append(f"{task['label']} - システムエラー: {e}")
 
@@ -183,15 +192,14 @@ if uploaded_files:
         # --- 結果表示 ---
         if error_log:
             with st.expander(f"⚠️ 読み取れなかったページ ({len(error_log)}件)"):
+                st.write("もし '429' エラーが多い場合は、少し時間をおいてから再試行してください。")
                 for err in error_log:
                     st.write(err)
             
         if all_rows:
             df = pd.DataFrame(all_rows)
             
-            # 見やすい列順
             cols = ["ページ", "日付", "仕入先", "JAN", "商品名", "数量", "単価", "金額", "掛け率", "インボイス"]
-            # 存在する列だけフィルタリング
             valid_cols = [c for c in cols if c in df.columns]
             df = df[valid_cols]
             
@@ -202,7 +210,7 @@ if uploaded_files:
             st.download_button(
                 label="CSVデータを保存 💾",
                 data=csv,
-                file_name="parallel_data.csv",
+                file_name="stable_data.csv",
                 mime="text/csv"
             )
         else:
