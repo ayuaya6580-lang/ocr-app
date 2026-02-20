@@ -12,7 +12,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 # ==========================================
 # 1. アプリの設定
 # ==========================================
-st.set_page_config(page_title="AI爆速読み取り(有料テスト版)", layout="wide")
+st.set_page_config(page_title="AI爆速読み取り(Pro版)", layout="wide")
 
 try:
     GOOGLE_API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -88,8 +88,8 @@ def analyze_page(page_bytes, label):
 # ==========================================
 # 4. メイン処理（範囲指定・5並列）
 # ==========================================
-st.title("⚡ AI爆速読み取り (有料枠テスト版)")
-st.markdown("有料枠のパワーを試すため、まずは**指定したページ範囲（例：1〜10ページ）**だけを5並列で高速処理します。")
+st.title("⚡ AI爆速読み取りシステム (Pro版)")
+st.markdown("有料枠のパワーを開放し、大容量のPDFも**5ページ同時進行**で一気に処理します。")
 
 uploaded_file = st.file_uploader("PDFファイルをアップロードしてください", type=["pdf"])
 
@@ -105,10 +105,10 @@ if uploaded_file:
         with col1:
             start_p = st.number_input("開始ページ", min_value=1, max_value=total_pages, value=1)
         with col2:
-            default_end = min(start_p + 9, total_pages) # デフォルトで10ページ分をセット
-            end_p = st.number_input("終了ページ", min_value=start_p, max_value=total_pages, value=default_end)
+            # ★ 本番用：デフォルトで「最後のページ」まで自動セットされます
+            end_p = st.number_input("終了ページ", min_value=start_p, max_value=total_pages, value=total_pages)
             
-        if st.button(f"🚀 指定範囲（{start_p}〜{end_p}ページ）でテスト実行", use_container_width=True):
+        if st.button(f"🚀 読み取り開始（{start_p}〜{end_p}ページ）", use_container_width=True):
             
             all_rows = []
             error_log = []
@@ -118,7 +118,6 @@ if uploaded_file:
             
             status_text.text(f"🚀 処理準備中... {start_p}〜{end_p} ページを展開します")
             
-            # 処理タスクの準備（指定範囲のみ）
             tasks = []
             for page_num in range(start_p, end_p + 1):
                 page_idx = page_num - 1 
@@ -128,7 +127,6 @@ if uploaded_file:
                     pdf_writer.write(output)
                     tasks.append({"bytes": output.getvalue(), "label": f"p{page_num}"})
             
-            # --- フルパワー並列処理（5並列） ---
             completed_count = 0
             
             with ThreadPoolExecutor(max_workers=5) as executor:
@@ -163,7 +161,6 @@ if uploaded_file:
             if all_rows:
                 df = pd.DataFrame(all_rows)
                 
-                # ページ番号順に並び替え
                 try:
                     df['sort_key'] = df['ページ'].str.replace('p', '').astype(int)
                     df = df.sort_values('sort_key').drop('sort_key', axis=1)
@@ -181,9 +178,9 @@ if uploaded_file:
                 
                 csv = df.to_csv(index=False).encode('utf-8-sig')
                 st.download_button(
-                    label=f"CSVを保存（{start_p}〜{end_p}P） 💾", 
+                    label=f"CSVを保存 💾", 
                     data=csv, 
-                    file_name=f"test_data_p{start_p}-{end_p}.csv", 
+                    file_name=f"final_data_p{start_p}-{end_p}.csv", 
                     mime="text/csv"
                 )
             else:
